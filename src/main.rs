@@ -1710,11 +1710,15 @@ fn main() -> Result<()> {
                 anyhow::bail!("datas/ folder not found");
             }
 
+            let ignore_dir = data_dir.join("ignores");
             let files: Vec<_> = fs::read_dir(data_dir)?
                 .par_bridge()
                 .filter_map(|entry| {
                     let entry = entry.ok()?;
                     let path = entry.path();
+                    if path.starts_with(&ignore_dir) {
+                        return None;
+                    }
                     if path.extension().and_then(|s| s.to_str()) == Some("txt") {
                         Some(path)
                     } else {
