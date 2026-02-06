@@ -1,18 +1,22 @@
 use anyhow::Result;
+use flate2::read::GzDecoder;
 use rand::prelude::*;
 use rand::distributions::WeightedIndex;
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs;
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::mpsc::{self, Sender, Receiver};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
+use tar::Archive;
 use regex::Regex;
+use zip::ZipArchive;
 
 /// Transition weight can be 8-bit (fast), 32-bit (precise), 64-bit (double), or TRUE 128-bit (u128)
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
@@ -57,8 +61,27 @@ const STOPWORDS: &[&str] = &[
     "should", "may", "might",
 ];
 
+const CONTEXT_SIZE: usize = 150;
+const SUBJECT_WINDOW: usize = 150;
+const CONVERSATION_HISTORY_CAP: usize = 500;
+const PROGRESS_EVERY_WORDS: usize = 50_000;
+const LARGE_FILE_BYTES: usize = 500_000;
+const CHUNK_LINES: usize = 1000;
+const STYLE_TOKEN_CHANCE: f32 = 0.08;
+const CONTEXT_PAIR_LIMIT: usize = 50;
+const CONTEXT_PAIR_SEARCH_LIMIT: usize = 100;
+const CONTEXT_PAIR_FORWARD_SEARCH_LIMIT: usize = 150;
+const RELEVANCE_SCAN_WINDOW: usize = 15;
+const RELEVANCE_WINDOW_SIZE: usize = 50;
+const DEFAULT_GENERATE_COUNT: usize = 50;
+const DEFAULT_TALK_COUNT: usize = 40;
+
 fn is_punct(token: &str) -> bool {
     matches!(token, "." | "," | "!" | "?" | ";" | ":")
+}
+
+fn is_quote_token(token: &str) -> bool {
+    token == "\""
 }
 
 fn is_word_token(token: &str) -> bool {
@@ -83,6 +106,12 @@ fn tokenize(text: &str) -> Vec<String> {
         let c = chars[i];
         if c.is_ascii_alphanumeric() || c == '\'' {
             current.push(c);
+        } else if c == '"' {
+            if !current.is_empty() {
+                tokens.push(current.to_ascii_lowercase());
+                current.clear();
+            }
+            tokens.push("\"".to_string());
         } else if matches!(c, '.' | ',' | '!' | '?' | ';' | ':') {
             if !current.is_empty() {
                 tokens.push(current.to_ascii_lowercase());
@@ -131,6 +160,14 @@ fn tokenize_with_case(text: &str) -> Vec<(String, String)> {
         let c = chars[i];
         if c.is_ascii_alphanumeric() || c == '\'' {
             current.push(c);
+        } else if c == '"' {
+            if !current.is_empty() {
+                let original = current.clone();
+                let lowercase = current.to_ascii_lowercase();
+                tokens.push((lowercase, original));
+                current.clear();
+            }
+            tokens.push(("\"".to_string(), "\"".to_string()));
         } else if matches!(c, '.' | ',' | '!' | '?' | ';' | ':') {
             if !current.is_empty() {
                 let original = current.clone();
@@ -178,20 +215,227 @@ fn tokenize_with_case(text: &str) -> Vec<(String, String)> {
 
 fn detokenize(tokens: &[String]) -> String {
     let mut out = String::new();
+    let mut prev_was_punct = false;
+    let mut in_quote = false;
+
     for token in tokens {
-        if out.is_empty() {
-            out.push_str(token);
+        if is_quote_token(token) {
+            if in_quote {
+                out.push_str(token);
+                in_quote = false;
+            } else {
+                if !out.is_empty() && !out.ends_with(' ') {
+                    out.push(' ');
+                }
+                out.push_str(token);
+                in_quote = true;
+            }
+            prev_was_punct = false;
             continue;
         }
 
         if is_punct(token) {
-            out.push_str(token);
-        } else {
-            out.push(' ');
-            out.push_str(token);
+            if prev_was_punct {
+                let last = out.chars().last().unwrap_or(' ');
+                let current = token.chars().next().unwrap_or(' ');
+                if last == current {
+                    out.push_str(token);
+                }
+            } else {
+                out.push_str(token);
+            }
+            prev_was_punct = true;
+            continue;
         }
+
+        let needs_space = !out.is_empty()
+            && !out.ends_with(' ')
+            && !(in_quote && out.ends_with('"'));
+        if needs_space {
+            out.push(' ');
+        }
+        out.push_str(token);
+        prev_was_punct = false;
     }
     out
+}
+
+fn is_supported_training_file(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    name.ends_with(".txt")
+        || name.ends_with(".gz")
+        || name.ends_with(".tgz")
+        || name.ends_with(".tar.gz")
+        || name.ends_with(".tar")
+        || name.ends_with(".zip")
+}
+
+fn read_text_from_reader<R: Read>(mut reader: R) -> Vec<String> {
+    let mut buf = Vec::new();
+    if reader.read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+
+    match String::from_utf8(buf) {
+        Ok(text) if !text.trim().is_empty() => vec![text],
+        _ => Vec::new(),
+    }
+}
+
+fn collect_tar_texts<R: Read>(archive: &mut Archive<R>) -> Vec<String> {
+    let mut texts = Vec::new();
+    let entries = match archive.entries() {
+        Ok(entries) => entries,
+        Err(_) => return texts,
+    };
+
+    for entry in entries {
+        let mut entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+
+        let path = match entry.path() {
+            Ok(path) => path.to_path_buf(),
+            Err(_) => continue,
+        };
+
+        if path.extension().and_then(|s| s.to_str()).map_or(true, |ext| ext != "txt") {
+            continue;
+        }
+
+        let mut buf = Vec::new();
+        if entry.read_to_end(&mut buf).is_ok() {
+            if let Ok(text) = String::from_utf8(buf) {
+                if !text.trim().is_empty() {
+                    texts.push(text);
+                }
+            }
+        }
+    }
+
+    texts
+}
+
+fn collect_zip_texts(archive: &mut ZipArchive<File>) -> Vec<String> {
+    let mut texts = Vec::new();
+    for i in 0..archive.len() {
+        let mut file = match archive.by_index(i) {
+            Ok(file) => file,
+            Err(_) => continue,
+        };
+
+        if file.is_dir() {
+            continue;
+        }
+
+        let name = file.name().to_ascii_lowercase();
+        if !name.ends_with(".txt") {
+            continue;
+        }
+
+        let mut buf = Vec::new();
+        if file.read_to_end(&mut buf).is_ok() {
+            if let Ok(text) = String::from_utf8(buf) {
+                if !text.trim().is_empty() {
+                    texts.push(text);
+                }
+            }
+        }
+    }
+    texts
+}
+
+fn read_training_texts(path: &Path) -> Result<Vec<String>> {
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if name.ends_with(".txt") {
+        return Ok(vec![fs::read_to_string(path)?]);
+    }
+
+    if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+        let file = File::open(path)?;
+        let decoder = GzDecoder::new(file);
+        let mut archive = Archive::new(decoder);
+        return Ok(collect_tar_texts(&mut archive));
+    }
+
+    if name.ends_with(".tar") {
+        let file = File::open(path)?;
+        let mut archive = Archive::new(file);
+        return Ok(collect_tar_texts(&mut archive));
+    }
+
+    if name.ends_with(".zip") {
+        let file = File::open(path)?;
+        let mut archive = ZipArchive::new(file)?;
+        return Ok(collect_zip_texts(&mut archive));
+    }
+
+    if name.ends_with(".gz") {
+        let file = File::open(path)?;
+        let decoder = GzDecoder::new(file);
+        return Ok(read_text_from_reader(decoder));
+    }
+
+    Ok(Vec::new())
+}
+
+fn load_nono_words(path: &str) -> FxHashSet<String> {
+    let content = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(_) => return FxHashSet::default(),
+    };
+
+    let mut words = FxHashSet::default();
+    for line in content.lines() {
+        let raw = line.split('#').next().unwrap_or("");
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        for token in trimmed.split_whitespace() {
+            let lower = token.to_ascii_lowercase();
+            if !lower.is_empty() {
+                words.insert(lower);
+            }
+        }
+    }
+    words
+}
+
+fn filter_tokens_with_case(
+    tokens: Vec<(String, String)>,
+    banned: &FxHashSet<String>,
+) -> Vec<(String, String)> {
+    if banned.is_empty() {
+        return tokens;
+    }
+
+    tokens
+        .into_iter()
+        .filter(|(lower, _)| {
+            if !is_word_token(lower) {
+                return true;
+            }
+            !banned.contains(lower)
+        })
+        .collect()
+}
+
+fn count_tokens_filtered(text: &str, banned: &FxHashSet<String>) -> usize {
+    let tokens = tokenize_with_case(text);
+    let filtered = filter_tokens_with_case(tokens, banned);
+    filtered.len()
 }
 
 /// GRAMMAR HELPER: Capitalize the first letter of a word
@@ -292,7 +536,7 @@ fn purify_text(text: &str) -> String {
 
 fn build_subject_weights(context: &VecDeque<String>) -> FxHashMap<String, f32> {
     let mut scores: FxHashMap<String, f32> = FxHashMap::default();
-    for token in context.iter().rev().take(150) {  // Increased from 80 to match new context_size
+    for token in context.iter().rev().take(SUBJECT_WINDOW) {
         if !is_word_token(token) {
             continue;
         }
@@ -317,7 +561,7 @@ fn build_subject_weights_with_user_boost(context: &VecDeque<String>, user_token_
     // Process most recent tokens (mostly user's last message + bot response)
     // Give recent tokens (especially user input) much higher weight
     let mut idx = 0;
-    for token in context.iter().rev().take(150) {
+    for token in context.iter().rev().take(SUBJECT_WINDOW) {
         if !is_word_token(token) {
             idx += 1;
             continue;
@@ -364,7 +608,7 @@ fn pick_style_token(style_counts: &FxHashMap<String, u32>, rng: &mut impl Rng) -
         return None;
     }
 
-    if rng.r#gen::<f32>() > 0.08 {
+    if rng.r#gen::<f32>() > STYLE_TOKEN_CHANCE {
         return None;
     }
 
@@ -423,7 +667,7 @@ fn find_semantic_cluster(word: &str, context: &[String]) -> Vec<String> {
 }
 
 /// Background relevance scanner - analyzes context in parallel to find most relevant topics
-/// Scans 15-token windows within the past 50 words
+/// Scans RELEVANCE_SCAN_WINDOW-token windows within the past RELEVANCE_WINDOW_SIZE words
 struct RelevanceScanner {
     context_rx: Receiver<Vec<String>>,
     query_tx: Sender<Option<String>>,
@@ -474,12 +718,12 @@ impl RelevanceScanner {
             return None;
         }
 
-        // Take last 50 words
-        let window_size = 50.min(context.len());
+        // Take last RELEVANCE_WINDOW_SIZE words
+        let window_size = RELEVANCE_WINDOW_SIZE.min(context.len());
         let recent = &context[context.len().saturating_sub(window_size)..];
 
-        // Scan 15-token windows at random positions (but in order)
-        let chunk_size = 15;
+        // Scan RELEVANCE_SCAN_WINDOW-token windows at random positions (but in order)
+        let chunk_size = RELEVANCE_SCAN_WINDOW;
         let mut topic_scores: FxHashMap<String, f32> = FxHashMap::default();
 
         for start in (0..recent.len()).step_by(5) {
@@ -665,7 +909,7 @@ impl FrozenModel {
     fn build_subject_weights_vec(&self, context: &VecDeque<String>, user_token_count: usize) -> Vec<f32> {
         let mut scores = vec![0.0f32; self.vocab.len()];
         let mut idx = 0;
-        for token in context.iter().rev().take(150) {
+        for token in context.iter().rev().take(SUBJECT_WINDOW) {
             if !is_word_token(token) {
                 idx += 1;
                 continue;
@@ -765,7 +1009,7 @@ impl FrozenModel {
                         *base_weight = (*base_weight + nudge).min(1.0);
                     }
 
-                    if ctx_pairs.len() < 100 {
+                    if ctx_pairs.len() < CONTEXT_PAIR_SEARCH_LIMIT {
                         if let Some((_, count)) = ctx_pairs.iter().find(|(w, _)| w == next_idx) {
                             let pair_strength = (*count as f32 / 100.0).min(1.0);
                             let nudge = pair_strength * distance_factor * 0.08;
@@ -782,7 +1026,7 @@ impl FrozenModel {
                 let ctx_pairs = &self.context_pairs[ctx_idx];
 
                 for (next_idx, base_weight) in nudged.iter_mut() {
-                    if ctx_pairs.len() < 100 {
+                    if ctx_pairs.len() < CONTEXT_PAIR_SEARCH_LIMIT {
                         if let Some((_, count)) = ctx_pairs.iter().find(|(w, _)| w == next_idx) {
                             let pair_strength = (*count as f32 / 100.0).min(1.0);
                             let nudge = pair_strength * distance_factor * 0.05;
@@ -819,13 +1063,15 @@ impl FrozenModel {
         let mut local_context: VecDeque<String> = VecDeque::new();
         let context_after: VecDeque<String> = VecDeque::with_capacity(self.context_size);
         let mut stream_first = true;
+        let mut stream_last: Option<String> = None;
+        let mut stream_in_quote = false;
 
         let mut current_idx = if let Some(pass) = pass_text {
             let pass_tokens = tokenize_with_case(pass);
             for (lower, original) in &pass_tokens {
                 output.push(original.clone());
                 if stream {
-                    stream_token(original, &mut stream_first);
+                    stream_token(original, &mut stream_first, &mut stream_last, &mut stream_in_quote);
                 }
                 update_context(&mut local_context, &[lower.clone()], self.context_size);
             }
@@ -845,7 +1091,7 @@ impl FrozenModel {
             let formatted_start = self.apply_grammar_index(&start_word, current_idx, true, 0);
             output.push(formatted_start.clone());
             if stream {
-                stream_token(&formatted_start, &mut stream_first);
+                stream_token(&formatted_start, &mut stream_first, &mut stream_last, &mut stream_in_quote);
             }
             update_context(&mut local_context, &[start_word.clone()], self.context_size);
         }
@@ -893,7 +1139,7 @@ impl FrozenModel {
 
                 output.push(formatted.clone());
                 if stream {
-                    stream_token(&formatted, &mut stream_first);
+                    stream_token(&formatted, &mut stream_first, &mut stream_last, &mut stream_in_quote);
                 }
                 update_context(&mut local_context, &[next_word.clone()], self.context_size);
                 current_idx = next_idx;
@@ -925,7 +1171,7 @@ impl NudgeBot {
             transitions: FxHashMap::default(),
             context_pairs: FxHashMap::default(),
             frequency: FxHashMap::default(),
-            context_size: 150, // Increased from 50 for better context awareness
+            context_size: CONTEXT_SIZE,
             precision_mode,
             // Grammar intelligence
             capitalization: FxHashMap::default(),
@@ -937,9 +1183,22 @@ impl NudgeBot {
     /// OPTIMIZED train with O(1) HashMap lookups, lazy normalization, and GRAMMAR AWARENESS
     /// Thread ID for progress tracking
     fn train(&mut self, text: &str, thread_id: Option<usize>) -> usize {
-        // Use case-preserving tokenizer for grammar intelligence
         let words_with_case = tokenize_with_case(text);
+        self.train_tokens(words_with_case, thread_id)
+    }
 
+    fn train_filtered(
+        &mut self,
+        text: &str,
+        banned: &FxHashSet<String>,
+        thread_id: Option<usize>,
+    ) -> usize {
+        let words_with_case = tokenize_with_case(text);
+        let filtered = filter_tokens_with_case(words_with_case, banned);
+        self.train_tokens(filtered, thread_id)
+    }
+
+    fn train_tokens(&mut self, words_with_case: Vec<(String, String)>, thread_id: Option<usize>) -> usize {
         if words_with_case.is_empty() {
             return 0;
         }
@@ -964,7 +1223,7 @@ impl NudgeBot {
         // Update frequency and transitions
         for i in 0..words_with_case.len() {
             // Progress indicator for large files
-            if i > 0 && i % 50000 == 0 {
+            if i > 0 && i % PROGRESS_EVERY_WORDS == 0 {
                 println!("{} Progress: {}/{} words...", thread_prefix, i, words_with_case.len());
             }
 
@@ -1025,7 +1284,7 @@ impl NudgeBot {
                         .or_insert_with(FxHashMap::default);
 
                     // O(1) lookup
-                    if ctx_entry.len() < 50 {
+                    if ctx_entry.len() < CONTEXT_PAIR_LIMIT {
                         *ctx_entry.entry(context_word_lower.clone()).or_insert(0) += decay.max(1);
                     }
                 }
@@ -1039,7 +1298,7 @@ impl NudgeBot {
                         .entry(word_lower.clone())
                         .or_insert_with(FxHashMap::default);
 
-                    if ctx_entry.len() < 50 {
+                    if ctx_entry.len() < CONTEXT_PAIR_LIMIT {
                         *ctx_entry.entry(context_word_lower.clone()).or_insert(0) += decay.max(1);
                     }
                 }
@@ -1065,7 +1324,7 @@ impl NudgeBot {
             for (ctx_word, count) in ctx_words {
                 if let Some(pair) = entry.iter_mut().find(|(w, _)| w == &ctx_word) {
                     pair.1 += count;
-                } else if entry.len() < 50 {
+                } else if entry.len() < CONTEXT_PAIR_LIMIT {
                     entry.push((ctx_word, count));
                 }
             }
@@ -1159,7 +1418,7 @@ impl NudgeBot {
             for (ctx_word, count) in other_pairs {
                 if let Some(pair) = entry.iter_mut().find(|(w, _)| w == &ctx_word) {
                     pair.1 += count;
-                } else if entry.len() < 50 {
+                } else if entry.len() < CONTEXT_PAIR_LIMIT {
                     entry.push((ctx_word, count));
                 }
             }
@@ -1268,7 +1527,7 @@ impl NudgeBot {
             }
 
             // Apply nudges from context BEFORE (backward) - only recent context for speed
-            for (distance, ctx_word) in context_before.iter().rev().take(10).enumerate() {
+            for (distance, ctx_word) in context_before.iter().rev().take(15).enumerate() {
                 let distance_factor = 1.0 / (1.0 + distance as f32 * 0.3); // Gradual decay
 
                 for (next_word, base_weight) in nudged.iter_mut() {
@@ -1286,7 +1545,7 @@ impl NudgeBot {
 
                     // Also check context pairs for associative nudging (skip if expensive)
                     if let Some(pairs) = self.context_pairs.get(ctx_word) {
-                        if pairs.len() < 100 {  // Only search if reasonable size
+                        if pairs.len() < CONTEXT_PAIR_SEARCH_LIMIT {
                             if let Some((_, count)) = pairs.iter().find(|(w, _)| w == next_word) {
                                 let pair_strength = (*count as f32 / 100.0).min(1.0);
                                 let nudge = pair_strength * distance_factor * 0.08;
@@ -1298,12 +1557,12 @@ impl NudgeBot {
             }
 
             // Apply nudges from context AFTER (forward) - only nearby context
-            for (distance, ctx_word) in context_after.iter().take(10).enumerate() {
+            for (distance, ctx_word) in context_after.iter().take(15).enumerate() {
                 let distance_factor = 1.0 / (1.0 + distance as f32 * 0.5); // Faster decay for future
 
                 for (next_word, base_weight) in nudged.iter_mut() {
                     if let Some(pairs) = self.context_pairs.get(ctx_word) {
-                        if pairs.len() < 100 {  // Only search if reasonable size
+                        if pairs.len() < CONTEXT_PAIR_FORWARD_SEARCH_LIMIT {
                             if let Some((_, count)) = pairs.iter().find(|(w, _)| w == next_word) {
                                 let pair_strength = (*count as f32 / 100.0).min(1.0);
                                 let nudge = pair_strength * distance_factor * 0.05; // 5% max for future
@@ -1417,13 +1676,15 @@ impl NudgeBot {
         let mut local_context = context_before.clone();
         let context_after: VecDeque<String> = VecDeque::with_capacity(self.context_size);
         let mut stream_first = true;
+        let mut stream_last: Option<String> = None;
+        let mut stream_in_quote = false;
         // Pick starting word (keep lowercase for lookups)
         let mut current_word = if let Some(pass) = pass_text {
             let pass_tokens = tokenize_with_case(pass);
             for (lower, original) in &pass_tokens {
                 output.push(original.clone());
                 if stream {
-                    stream_token(original, &mut stream_first);
+                    stream_token(original, &mut stream_first, &mut stream_last, &mut stream_in_quote);
                 }
                 update_context(&mut local_context, &[lower.clone()], self.context_size);
             }
@@ -1453,7 +1714,7 @@ impl NudgeBot {
             let start_word = self.apply_grammar(&current_word, true, 0);
             output.push(start_word.clone());
             if stream {
-                stream_token(&start_word, &mut stream_first);
+                stream_token(&start_word, &mut stream_first, &mut stream_last, &mut stream_in_quote);
             }
             update_context(&mut local_context, &[current_word.clone()], self.context_size);
         }
@@ -1513,7 +1774,7 @@ impl NudgeBot {
 
                 output.push(formatted_word.clone());
                 if stream {
-                    stream_token(&formatted_word, &mut stream_first);
+                    stream_token(&formatted_word, &mut stream_first, &mut stream_last, &mut stream_in_quote);
                 }
                 update_context(&mut local_context, &[next_word.clone()], self.context_size);
                 current_word = next_word.clone();
@@ -1636,15 +1897,54 @@ fn parse_pass_arg(args: &[String]) -> Option<String> {
     None
 }
 
-fn stream_token(token: &str, is_first: &mut bool) {
-    if *is_first {
+fn stream_token(
+    token: &str,
+    is_first: &mut bool,
+    last_token: &mut Option<String>,
+    in_quote: &mut bool,
+) {
+    if is_quote_token(token) {
+        if *in_quote {
+            print!("{}", token);
+            *in_quote = false;
+        } else {
+            if !*is_first {
+                print!(" ");
+            }
+            print!("{}", token);
+            *in_quote = true;
+        }
+        *is_first = false;
+        *last_token = Some(token.to_string());
+        let _ = io::stdout().flush();
+        return;
+    }
+
+    if is_punct(token) {
+        if let Some(prev) = last_token.as_deref() {
+            if is_punct(prev) {
+                if prev == token {
+                    print!("{}", token);
+                    *last_token = Some(token.to_string());
+                }
+                let _ = io::stdout().flush();
+                return;
+            }
+        }
         print!("{}", token);
         *is_first = false;
-    } else if is_punct(token) {
-        print!("{}", token);
-    } else {
-        print!(" {}", token);
+        *last_token = Some(token.to_string());
+        let _ = io::stdout().flush();
+        return;
     }
+
+    let needs_space = !*is_first && !(*in_quote && matches!(last_token.as_deref(), Some("\"")));
+    if needs_space {
+        print!(" ");
+    }
+    print!("{}", token);
+    *is_first = false;
+    *last_token = Some(token.to_string());
     let _ = io::stdout().flush();
 }
 
@@ -1654,8 +1954,8 @@ fn main() -> Result<()> {
     if args.len() < 2 {
         eprintln!("Usage: {} <train|generate|talk|train-fragment|merge-fragments|freeze> [options]", args[0]);
         eprintln!("Train on datas/ folder: {} train [--bits=8|64|128|256] [--normalize-data]", args[0]);
-        eprintln!("Generate: {} generate 50 [--bits=8|64|128|256] [--pure] [--pass <text>] [--stream]", args[0]);
-        eprintln!("Talk: {} talk 40 [--bits=8|64|128|256]", args[0]);
+        eprintln!("Generate: {} generate {} [--bits=8|64|128|256] [--pure] [--pass <text>] [--stream]", args[0], DEFAULT_GENERATE_COUNT);
+        eprintln!("Talk: {} talk {} [--bits=8|64|128|256]", args[0], DEFAULT_TALK_COUNT);
         eprintln!("Train fragment: {} train-fragment <file> [--bits=8|64|128|256]", args[0]);
         eprintln!("Merge fragments: {} merge-fragments [--bits=8|64|128|256]", args[0]);
         eprintln!("Freeze: {} freeze [--bits=8|64|128|256]", args[0]);
@@ -1699,12 +1999,13 @@ fn main() -> Result<()> {
     let pass_text = parse_pass_arg(&args);
     let stream = args.iter().any(|arg| arg == "--stream");
     let command = &args[1];
+    let banned_words = load_nono_words("nono.txt");
 
     match command.as_str() {
         "train" | "t" => {
             println!("[◐] PARALLEL training on files from datas/ folder...");
 
-            // Read all .txt files from datas/ folder (parallel discovery)
+            // Read all supported files from datas/ folder (parallel discovery)
             let data_dir = Path::new("datas");
             if !data_dir.exists() {
                 anyhow::bail!("datas/ folder not found");
@@ -1719,7 +2020,7 @@ fn main() -> Result<()> {
                     if path.starts_with(&ignore_dir) {
                         return None;
                     }
-                    if path.extension().and_then(|s| s.to_str()) == Some("txt") {
+                    if path.is_file() && is_supported_training_file(&path) {
                         Some(path)
                     } else {
                         None
@@ -1736,13 +2037,19 @@ fn main() -> Result<()> {
             // Precompute per-file token counts if normalization is enabled
             let file_stats: Vec<(std::path::PathBuf, usize)> = if normalize_data {
                 files.par_iter().map(|path| {
-                    if let Ok(content) = fs::read_to_string(path) {
-                        let purified = purify_text(&content);
-                        let count = tokenize_with_case(&purified).len();
-                        (path.clone(), count)
-                    } else {
-                        (path.clone(), 0)
+                    let texts = read_training_texts(path).unwrap_or_default();
+                    if texts.is_empty() {
+                        return (path.clone(), 0);
                     }
+
+                    let count: usize = texts
+                        .iter()
+                        .map(|text| {
+                            let purified = purify_text(text);
+                            count_tokens_filtered(&purified, &banned_words)
+                        })
+                        .sum();
+                    (path.clone(), count)
                 }).collect()
             } else {
                 files.into_iter().map(|path| (path, 0)).collect()
@@ -1766,11 +2073,12 @@ fn main() -> Result<()> {
             let mut final_bot = file_stats.into_par_iter().map(|(path, token_count)| {
                 let thread_id = thread_counter.fetch_add(1, Ordering::Relaxed) + 1;
                 let mut local_bot = NudgeBot::new(precision_mode);
-                if let Ok(content) = fs::read_to_string(&path) {
-                    println!("[Thread {}] Processing: {}", thread_id, path.display());
+                if let Ok(texts) = read_training_texts(&path) {
+                    if texts.is_empty() {
+                        return local_bot;
+                    }
 
-                    // PURIFY: Remove URLs, markdown, forewords, navigation, etc.
-                    let purified = purify_text(&content);
+                    println!("[Thread {}] Processing: {}", thread_id, path.display());
 
                     let scale = if normalize_data && token_count > 0 {
                         (avg_tokens / token_count as f32).min(1.0)
@@ -1778,33 +2086,41 @@ fn main() -> Result<()> {
                         1.0
                     };
 
-                    // Process giant files with parallel chunks for HUGE files (1M+ words)
-                    if purified.len() > 500_000 {
-                        println!("[Thread {}] Large file detected ({} bytes) - chunking...", thread_id, purified.len());
-
-                        // Split into lines and process in parallel batches
-                        let lines: Vec<&str> = purified.lines().collect();
-                        let chunk_size = 1000; // Process 1000 lines at a time
-
-                        // Create sub-bots for each chunk
-                        let chunk_bots: Vec<NudgeBot> = lines.par_chunks(chunk_size)
-                            .enumerate()
-                            .map(|(chunk_idx, chunk_lines)| {
-                                let mut chunk_bot = NudgeBot::new(precision_mode);
-                                let chunk_text = chunk_lines.join(" ");
-                                let _ = chunk_idx;
-                                let _ = chunk_bot.train(&chunk_text, Some(thread_id));
-                                chunk_bot
-                            })
-                            .collect();
-
-                        // Merge all chunk bots into local bot
-                        println!("[Thread {}] Merging {} chunks...", thread_id, chunk_bots.len());
-                        for chunk_bot in chunk_bots {
-                            local_bot.merge(chunk_bot);
+                    for text in texts {
+                        // PURIFY: Remove URLs, markdown, forewords, navigation, etc.
+                        let purified = purify_text(&text);
+                        if purified.is_empty() {
+                            continue;
                         }
-                    } else {
-                        let _ = local_bot.train(&purified, Some(thread_id));
+
+                        // Process giant files with parallel chunks for HUGE files (1M+ words)
+                        if purified.len() > LARGE_FILE_BYTES {
+                            println!("[Thread {}] Large file detected ({} bytes) - chunking...", thread_id, purified.len());
+
+                            // Split into lines and process in parallel batches
+                            let lines: Vec<&str> = purified.lines().collect();
+                            let chunk_size = CHUNK_LINES;
+
+                            // Create sub-bots for each chunk
+                            let chunk_bots: Vec<NudgeBot> = lines.par_chunks(chunk_size)
+                                .enumerate()
+                                .map(|(chunk_idx, chunk_lines)| {
+                                    let mut chunk_bot = NudgeBot::new(precision_mode);
+                                    let chunk_text = chunk_lines.join(" ");
+                                    let _ = chunk_idx;
+                                    let _ = chunk_bot.train_filtered(&chunk_text, &banned_words, Some(thread_id));
+                                    chunk_bot
+                                })
+                                .collect();
+
+                            // Merge all chunk bots into local bot
+                            println!("[Thread {}] Merging {} chunks...", thread_id, chunk_bots.len());
+                            for chunk_bot in chunk_bots {
+                                local_bot.merge(chunk_bot);
+                            }
+                        } else {
+                            let _ = local_bot.train_filtered(&purified, &banned_words, Some(thread_id));
+                        }
                     }
 
                     if normalize_data {
@@ -1832,7 +2148,7 @@ fn main() -> Result<()> {
             let count = args
                 .get(2)
                 .and_then(|c| c.parse().ok())
-                .unwrap_or(50);
+                .unwrap_or(DEFAULT_GENERATE_COUNT);
 
             let output = if pure_markov {
                 let bot = NudgeBot::load(model_path)?;
@@ -1844,19 +2160,21 @@ fn main() -> Result<()> {
                 let bot = NudgeBot::load(model_path)?;
                 bot.generate_with_context_and_user_boost(count, None, &VecDeque::new(), &FxHashMap::default(), 0, stream, pass_text.as_deref())
             };
-            println!("{}", output);
+            if !stream {
+                println!("{}", output);
+            }
         }
         "talk" | "chat" => {
             let count = args
                 .get(2)
                 .and_then(|c| c.parse().ok())
-                .unwrap_or(40);
+                .unwrap_or(DEFAULT_TALK_COUNT);
 
             let bot = NudgeBot::load(model_path)?;
             let mut context: VecDeque<String> = VecDeque::with_capacity(bot.context_size);
             let mut style_counts: FxHashMap<String, u32> = FxHashMap::default();
             // Cross-turn memory: keeps track of all topics discussed in conversation
-            let mut conversation_history: VecDeque<String> = VecDeque::with_capacity(500);
+            let mut conversation_history: VecDeque<String> = VecDeque::with_capacity(CONVERSATION_HISTORY_CAP);
 
             println!("Talk mode. Type /exit to quit.");
 
@@ -1884,7 +2202,7 @@ fn main() -> Result<()> {
                 // Add to long-term conversation history
                 for token in &tokens {
                     conversation_history.push_back(token.clone());
-                    if conversation_history.len() > 500 {
+                    if conversation_history.len() > CONVERSATION_HISTORY_CAP {
                         conversation_history.pop_front();
                     }
                 }
@@ -1898,7 +2216,7 @@ fn main() -> Result<()> {
                 // Also add bot response to conversation history
                 for token in &reply_tokens {
                     conversation_history.push_back(token.clone());
-                    if conversation_history.len() > 500 {
+                    if conversation_history.len() > CONVERSATION_HISTORY_CAP {
                         conversation_history.pop_front();
                     }
                 }
@@ -1917,12 +2235,20 @@ fn main() -> Result<()> {
 
             println!("[◐] Training fragment from: {}", file_path.display());
             let mut bot = NudgeBot::new(precision_mode);
-            let content = fs::read_to_string(file_path)?;
+            let texts = read_training_texts(file_path)?;
+            if texts.is_empty() {
+                anyhow::bail!("No readable text found in {}", file_path.display());
+            }
 
             // PURIFY: Remove URLs, markdown, forewords, navigation, etc.
             println!("[◐] Purifying training data...");
-            let purified = purify_text(&content);
-            let _ = bot.train(&purified, None);  // None = no thread ID for single-file training
+            for text in texts {
+                let purified = purify_text(&text);
+                if purified.is_empty() {
+                    continue;
+                }
+                let _ = bot.train_filtered(&purified, &banned_words, None);  // None = no thread ID for single-file training
+            }
 
             // FINALIZE before saving
             bot.finalize();
