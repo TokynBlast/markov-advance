@@ -1,4 +1,5 @@
 use anyhow::Result;
+use crossbeam_channel::unbounded;
 use flate2::read::GzDecoder;
 use rand::prelude::*;
 use rand::distributions::WeightedIndex;
@@ -2046,7 +2047,7 @@ fn main() -> Result<()> {
     let pass_text = parse_pass_arg(&args);
     let stream = args.iter().any(|arg| arg == "--stream");
     let command = &args[1];
-    let banned_words = load_nono_words("nono.txt");
+    let banned_words = Arc::new(load_nono_words("nono.txt"));
 
     match command.as_str() {
         "train" | "t" => {
@@ -2093,7 +2094,7 @@ fn main() -> Result<()> {
                         .iter()
                         .map(|text| {
                             let purified = purify_text(text);
-                            count_tokens_filtered(&purified, &banned_words)
+                            count_tokens_filtered(&purified, banned_words.as_ref())
                         })
                         .sum();
                     (path.clone(), count)
@@ -2113,86 +2114,133 @@ fn main() -> Result<()> {
                 0.0
             };
 
-            // Thread counter for progress tracking
+            // Thread counter for worker IDs
             let thread_counter = Arc::new(AtomicUsize::new(0));
+            let worker_count = rayon::current_num_threads().max(2);
+            let merge_workers = (worker_count / 2).max(1);
+            println!("[◐] Training workers: {} | Merge workers: {}", worker_count, merge_workers);
 
-            // Parallel training: each file gets its own NudgeBot, then merge
-            let mut final_bot = file_stats.into_par_iter().map(|(path, token_count)| {
-                let thread_id = thread_counter.fetch_add(1, Ordering::Relaxed) + 1;
-                let mut local_bot = NudgeBot::new(precision_mode);
-                if let Ok(texts) = read_training_texts(&path) {
-                    if texts.is_empty() {
-                        return local_bot;
-                    }
+            let (file_tx, file_rx) = unbounded::<(std::path::PathBuf, usize)>();
+            for item in file_stats {
+                let _ = file_tx.send(item);
+            }
+            drop(file_tx);
 
-                    println!("[Thread {}] Processing: {}", thread_id, path.display());
+            let (bot_tx, bot_rx) = unbounded::<NudgeBot>();
+            let (merge_tx, merge_rx) = unbounded::<NudgeBot>();
 
-                    let scale = if normalize_data && token_count > 0 {
-                        (avg_tokens / token_count as f32).min(1.0)
-                    } else {
-                        1.0
-                    };
-
-                    for text in texts {
-                        // PURIFY: Remove URLs, markdown, forewords, navigation, etc.
-                        let purified = purify_text(&text);
-                        if purified.is_empty() {
-                            continue;
-                        }
-
-                        // Process giant files with parallel chunks for HUGE files (1M+ words)
-                        if purified.len() > LARGE_FILE_BYTES {
-                            println!("[Thread {}] Large file detected ({} bytes) - chunking...", thread_id, purified.len());
-
-                            // Split into lines and process in parallel batches
-                            let lines: Vec<&str> = purified.lines().collect();
-                            let threads = rayon::current_num_threads().max(2);
-                            let target_chunks = threads * 4;
-                            let mut chunk_size = CHUNK_LINES;
-                            if lines.len() > chunk_size {
-                                let dynamic = (lines.len() / target_chunks).max(1);
-                                chunk_size = chunk_size.max(dynamic);
+            let mut worker_handles = Vec::new();
+            for _ in 0..worker_count {
+                let rx = file_rx.clone();
+                let tx = bot_tx.clone();
+                let thread_counter = Arc::clone(&thread_counter);
+                let banned_words = Arc::clone(&banned_words);
+                let handle = thread::spawn(move || {
+                    let worker_id = thread_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    while let Ok((path, token_count)) = rx.recv() {
+                        let mut local_bot = NudgeBot::new(precision_mode);
+                        if let Ok(texts) = read_training_texts(&path) {
+                            if texts.is_empty() {
+                                let _ = tx.send(local_bot);
+                                continue;
                             }
 
-                            // Create sub-bots for each chunk
-                            let chunk_bots: Vec<NudgeBot> = lines.par_chunks(chunk_size)
-                                .enumerate()
-                                .map(|(chunk_idx, chunk_lines)| {
-                                    let mut chunk_bot = NudgeBot::new(precision_mode);
-                                    let chunk_text = chunk_lines.join(" ");
-                                    let _ = chunk_idx;
-                                    let _ = chunk_bot.train_filtered(&chunk_text, &banned_words, Some(thread_id));
-                                    chunk_bot
-                                })
-                                .collect();
+                            println!("[Thread {}] Processing: {}", worker_id, path.display());
 
-                            // Merge all chunk bots into local bot
-                            println!("[Thread {}] Merging {} chunks...", thread_id, chunk_bots.len());
-                            let merged_chunks = chunk_bots
-                                .into_par_iter()
-                                .reduce(|| NudgeBot::new(precision_mode), |mut bot_a, bot_b| {
-                                    bot_a.merge(bot_b);
-                                    bot_a
-                                });
-                            local_bot.merge(merged_chunks);
-                        } else {
-                            let _ = local_bot.train_filtered(&purified, &banned_words, Some(thread_id));
+                            let scale = if normalize_data && token_count > 0 {
+                                (avg_tokens / token_count as f32).min(1.0)
+                            } else {
+                                1.0
+                            };
+
+                            for text in texts {
+                                // PURIFY: Remove URLs, markdown, forewords, navigation, etc.
+                                let purified = purify_text(&text);
+                                if purified.is_empty() {
+                                    continue;
+                                }
+
+                                // Process giant files with parallel chunks for HUGE files (1M+ words)
+                                if purified.len() > LARGE_FILE_BYTES {
+                                    println!("[Thread {}] Large file detected ({} bytes) - chunking...", worker_id, purified.len());
+
+                                    // Split into lines and process in parallel batches
+                                    let lines: Vec<&str> = purified.lines().collect();
+                                    let threads = rayon::current_num_threads().max(2);
+                                    let target_chunks = threads * 4;
+                                    let mut chunk_size = CHUNK_LINES;
+                                    if lines.len() > chunk_size {
+                                        let dynamic = (lines.len() / target_chunks).max(1);
+                                        chunk_size = chunk_size.max(dynamic);
+                                    }
+
+                                    // Create sub-bots for each chunk
+                                    let chunk_bots: Vec<NudgeBot> = lines.par_chunks(chunk_size)
+                                        .enumerate()
+                                        .map(|(chunk_idx, chunk_lines)| {
+                                            let mut chunk_bot = NudgeBot::new(precision_mode);
+                                            let chunk_text = chunk_lines.join(" ");
+                                            let _ = chunk_idx;
+                                            let _ = chunk_bot.train_filtered(&chunk_text, banned_words.as_ref(), Some(worker_id));
+                                            chunk_bot
+                                        })
+                                        .collect();
+
+                                    // Merge all chunk bots into local bot
+                                    println!("[Thread {}] Merging {} chunks...", worker_id, chunk_bots.len());
+                                    let merged_chunks = chunk_bots
+                                        .into_par_iter()
+                                        .reduce(|| NudgeBot::new(precision_mode), |mut bot_a, bot_b| {
+                                            bot_a.merge(bot_b);
+                                            bot_a
+                                        });
+                                    local_bot.merge(merged_chunks);
+                                } else {
+                                    let _ = local_bot.train_filtered(&purified, banned_words.as_ref(), Some(worker_id));
+                                }
+                            }
+
+                            if normalize_data {
+                                local_bot.scale_model(scale);
+                            }
+                            println!("[Thread {}] Complete: {}", worker_id, path.display());
                         }
+                        let _ = tx.send(local_bot);
                     }
+                });
+                worker_handles.push(handle);
+            }
+            drop(bot_tx);
 
-                    if normalize_data {
-                        local_bot.scale_model(scale);
+            let mut merge_handles = Vec::new();
+            for _ in 0..merge_workers {
+                let rx = bot_rx.clone();
+                let tx = merge_tx.clone();
+                let handle = thread::spawn(move || {
+                    let mut merged = NudgeBot::new(precision_mode);
+                    while let Ok(bot) = rx.recv() {
+                        merged.merge(bot);
                     }
-                    println!("[Thread {}] Complete: {}", thread_id, path.display());
+                    let _ = tx.send(merged);
+                });
+                merge_handles.push(handle);
+            }
+            drop(merge_tx);
+            drop(bot_rx);
+
+            for handle in worker_handles {
+                let _ = handle.join();
+            }
+
+            let mut final_bot = NudgeBot::new(precision_mode);
+            for _ in 0..merge_workers {
+                if let Ok(partial) = merge_rx.recv() {
+                    final_bot.merge(partial);
                 }
-                local_bot
-            }).reduce(
-                || NudgeBot::new(precision_mode),
-                |mut bot_a, bot_b| {
-                    bot_a.merge(bot_b);
-                    bot_a
-                }
-            );
+            }
+            for handle in merge_handles {
+                let _ = handle.join();
+            }
 
             // FINALIZE: Lazy normalization happens ONCE at the very end
             println!("[◐] All threads complete - finalizing model...");
@@ -2304,7 +2352,7 @@ fn main() -> Result<()> {
                 if purified.is_empty() {
                     continue;
                 }
-                let _ = bot.train_filtered(&purified, &banned_words, None);  // None = no thread ID for single-file training
+                let _ = bot.train_filtered(&purified, banned_words.as_ref(), None);  // None = no thread ID for single-file training
             }
 
             // FINALIZE before saving
