@@ -13,6 +13,7 @@ use std::path::Path;
 use std::sync::mpsc::{self, Sender, Receiver};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::thread;
 use tar::Archive;
 use regex::Regex;
@@ -67,6 +68,7 @@ const CONVERSATION_HISTORY_CAP: usize = 500;
 const PROGRESS_EVERY_WORDS: usize = 50_000;
 const LARGE_FILE_BYTES: usize = 500_000;
 const CHUNK_LINES: usize = 1000;
+const PARALLEL_MERGE_MIN: usize = 10_000;
 const STYLE_TOKEN_CHANCE: f32 = 0.08;
 const CONTEXT_PAIR_LIMIT: usize = 50;
 const CONTEXT_PAIR_SEARCH_LIMIT: usize = 100;
@@ -1393,51 +1395,96 @@ impl NudgeBot {
 
     /// Merge another NudgeBot into this one (for parallel training)
     fn merge(&mut self, other: NudgeBot) {
-        // Merge frequencies
-        for (word, count) in other.frequency {
+        let NudgeBot {
+            transitions,
+            context_pairs,
+            frequency,
+            capitalization,
+            sentence_starters,
+            after_punctuation,
+            ..
+        } = other;
+
+        // Merge frequencies (fast enough to keep sequential)
+        for (word, count) in frequency {
             *self.frequency.entry(word).or_insert(0) += count;
         }
 
-        // Merge transitions
-        for (word, other_list) in other.transitions {
-            let entry = self.transitions.entry(word).or_insert_with(Vec::new);
-            for (next_word, weight) in other_list {
-                if let Some(pair) = entry.iter_mut().find(|(w, _)| w == &next_word) {
-                    // Combine weights (sum, will renormalize later)
-                    let combined = pair.1.to_f32() + weight.to_f32();
-                    pair.1 = TransitionWeight::from_f32(combined, self.precision_mode);
-                } else {
-                    entry.push((next_word, weight));
+        // Merge transitions and context pairs in parallel when very large
+        if transitions.len() >= PARALLEL_MERGE_MIN || context_pairs.len() >= PARALLEL_MERGE_MIN {
+            let transitions_map = Mutex::new(std::mem::take(&mut self.transitions));
+            transitions
+                .into_par_iter()
+                .for_each(|(word, other_list)| {
+                    let mut map = transitions_map.lock().unwrap();
+                    let entry = map.entry(word).or_insert_with(Vec::new);
+                    for (next_word, weight) in other_list {
+                        if let Some(pair) = entry.iter_mut().find(|(w, _)| w == &next_word) {
+                            let combined = pair.1.to_f32() + weight.to_f32();
+                            pair.1 = TransitionWeight::from_f32(combined, self.precision_mode);
+                        } else {
+                            entry.push((next_word, weight));
+                        }
+                    }
+                });
+            self.transitions = transitions_map.into_inner().unwrap();
+
+            let context_map = Mutex::new(std::mem::take(&mut self.context_pairs));
+            context_pairs
+                .into_par_iter()
+                .for_each(|(word, other_pairs)| {
+                    let mut map = context_map.lock().unwrap();
+                    let entry = map.entry(word).or_insert_with(Vec::new);
+                    for (ctx_word, count) in other_pairs {
+                        if let Some(pair) = entry.iter_mut().find(|(w, _)| w == &ctx_word) {
+                            pair.1 += count;
+                        } else if entry.len() < CONTEXT_PAIR_LIMIT {
+                            entry.push((ctx_word, count));
+                        }
+                    }
+                });
+            self.context_pairs = context_map.into_inner().unwrap();
+        } else {
+            // Merge transitions
+            for (word, other_list) in transitions {
+                let entry = self.transitions.entry(word).or_insert_with(Vec::new);
+                for (next_word, weight) in other_list {
+                    if let Some(pair) = entry.iter_mut().find(|(w, _)| w == &next_word) {
+                        let combined = pair.1.to_f32() + weight.to_f32();
+                        pair.1 = TransitionWeight::from_f32(combined, self.precision_mode);
+                    } else {
+                        entry.push((next_word, weight));
+                    }
                 }
             }
-        }
 
-        // Merge context pairs
-        for (word, other_pairs) in other.context_pairs {
-            let entry = self.context_pairs.entry(word).or_insert_with(Vec::new);
-            for (ctx_word, count) in other_pairs {
-                if let Some(pair) = entry.iter_mut().find(|(w, _)| w == &ctx_word) {
-                    pair.1 += count;
-                } else if entry.len() < CONTEXT_PAIR_LIMIT {
-                    entry.push((ctx_word, count));
+            // Merge context pairs
+            for (word, other_pairs) in context_pairs {
+                let entry = self.context_pairs.entry(word).or_insert_with(Vec::new);
+                for (ctx_word, count) in other_pairs {
+                    if let Some(pair) = entry.iter_mut().find(|(w, _)| w == &ctx_word) {
+                        pair.1 += count;
+                    } else if entry.len() < CONTEXT_PAIR_LIMIT {
+                        entry.push((ctx_word, count));
+                    }
                 }
             }
         }
 
         // GRAMMAR: Merge capitalization patterns
-        for (word, (cap_count, lower_count)) in other.capitalization {
+        for (word, (cap_count, lower_count)) in capitalization {
             let entry = self.capitalization.entry(word).or_insert((0, 0));
             entry.0 += cap_count;
             entry.1 += lower_count;
         }
 
         // GRAMMAR: Merge sentence starters
-        for (word, count) in other.sentence_starters {
+        for (word, count) in sentence_starters {
             *self.sentence_starters.entry(word).or_insert(0) += count;
         }
 
         // GRAMMAR: Merge after-punctuation patterns
-        for (word, count) in other.after_punctuation {
+        for (word, count) in after_punctuation {
             *self.after_punctuation.entry(word).or_insert(0) += count;
         }
     }
