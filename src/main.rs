@@ -2099,7 +2099,13 @@ fn main() -> Result<()> {
 
                             // Split into lines and process in parallel batches
                             let lines: Vec<&str> = purified.lines().collect();
-                            let chunk_size = CHUNK_LINES;
+                            let threads = rayon::current_num_threads().max(2);
+                            let target_chunks = threads * 4;
+                            let mut chunk_size = CHUNK_LINES;
+                            if lines.len() > chunk_size {
+                                let dynamic = (lines.len() / target_chunks).max(1);
+                                chunk_size = chunk_size.max(dynamic);
+                            }
 
                             // Create sub-bots for each chunk
                             let chunk_bots: Vec<NudgeBot> = lines.par_chunks(chunk_size)
@@ -2115,9 +2121,13 @@ fn main() -> Result<()> {
 
                             // Merge all chunk bots into local bot
                             println!("[Thread {}] Merging {} chunks...", thread_id, chunk_bots.len());
-                            for chunk_bot in chunk_bots {
-                                local_bot.merge(chunk_bot);
-                            }
+                            let merged_chunks = chunk_bots
+                                .into_par_iter()
+                                .reduce(|| NudgeBot::new(precision_mode), |mut bot_a, bot_b| {
+                                    bot_a.merge(bot_b);
+                                    bot_a
+                                });
+                            local_bot.merge(merged_chunks);
                         } else {
                             let _ = local_bot.train_filtered(&purified, &banned_words, Some(thread_id));
                         }
