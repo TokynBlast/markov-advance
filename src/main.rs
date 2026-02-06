@@ -6,6 +6,7 @@ use rand::distributions::WeightedIndex;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fs;
 use std::fs::File;
@@ -70,6 +71,8 @@ const PROGRESS_EVERY_WORDS: usize = 50_000;
 const LARGE_FILE_BYTES: usize = 500_000;
 const CHUNK_LINES: usize = 1000;
 const PARALLEL_MERGE_MIN: usize = 10_000;
+const GPU_NORMALIZE_MIN_WEIGHTS: usize = 200_000;
+const GPU_WORKGROUP_SIZE: u32 = 256;
 const STYLE_TOKEN_CHANCE: f32 = 0.08;
 const CONTEXT_PAIR_LIMIT: usize = 50;
 const CONTEXT_PAIR_SEARCH_LIMIT: usize = 100;
@@ -78,6 +81,242 @@ const RELEVANCE_SCAN_WINDOW: usize = 15;
 const RELEVANCE_WINDOW_SIZE: usize = 50;
 const DEFAULT_GENERATE_COUNT: usize = 50;
 const DEFAULT_TALK_COUNT: usize = 40;
+
+const GPU_NORMALIZE_SHADER: &str = r#"
+@group(0) @binding(0)
+var<storage, read_write> weights: array<f32>;
+
+@group(0) @binding(1)
+var<storage, read> word_index: array<u32>;
+
+@group(0) @binding(2)
+var<storage, read> totals: array<f32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= arrayLength(&weights)) {
+        return;
+    }
+    let idx = word_index[i];
+    let total = totals[idx];
+    if (total > 0.0) {
+        weights[i] = weights[i] / total;
+    }
+}
+"#;
+
+struct GpuBackend {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+}
+
+impl GpuBackend {
+    fn init(preference: &str) -> Option<Self> {
+        let instance = wgpu::Instance::default();
+        let pref = preference.to_ascii_lowercase();
+
+        let adapter = if pref == "auto" {
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            }))
+        } else {
+            let vendor = match pref.as_str() {
+                "nvidia" => Some(0x10de),
+                "amd" => Some(0x1002),
+                "intel" => Some(0x8086),
+                _ => None,
+            };
+
+            let mut picked = None;
+            for adapter in instance.enumerate_adapters(wgpu::Backends::all()) {
+                let info = adapter.get_info();
+                let name = info.name.to_ascii_lowercase();
+                let vendor_match = vendor.map(|v| info.vendor == v).unwrap_or(false);
+                if vendor_match || name.contains(&pref) {
+                    picked = Some(adapter);
+                    break;
+                }
+            }
+
+            picked.or_else(|| {
+                pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                }))
+            })
+        }?;
+
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("gpu-device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::downlevel_defaults(),
+            },
+            None,
+        ))
+        .ok()?;
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("normalize-shader"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(GPU_NORMALIZE_SHADER)),
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("normalize-bind-group-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("normalize-pipeline-layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("normalize-pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: "main",
+        });
+
+        Some(Self {
+            device,
+            queue,
+            pipeline,
+            bind_group_layout,
+        })
+    }
+
+    fn normalize_weights(&self, weights: &mut [f32], word_index: &[u32], totals: &[f32]) -> bool {
+        if weights.is_empty() {
+            return false;
+        }
+
+        let weights_bytes = bytemuck::cast_slice(weights);
+        let index_bytes = bytemuck::cast_slice(word_index);
+        let totals_bytes = bytemuck::cast_slice(totals);
+
+        let weights_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("weights-buffer"),
+            size: weights_bytes.len() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&weights_buffer, 0, weights_bytes);
+
+        let index_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("index-buffer"),
+            size: index_bytes.len() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&index_buffer, 0, index_bytes);
+
+        let totals_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("totals-buffer"),
+            size: totals_bytes.len() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&totals_buffer, 0, totals_bytes);
+
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("weights-readback"),
+            size: weights_bytes.len() as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("normalize-bind-group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: weights_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: index_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: totals_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("normalize-encoder"),
+        });
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("normalize-pass"),
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let workgroups = (weights.len() as u32 + GPU_WORKGROUP_SIZE - 1) / GPU_WORKGROUP_SIZE;
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+
+        encoder.copy_buffer_to_buffer(&weights_buffer, 0, &readback, 0, weights_bytes.len() as u64);
+        self.queue.submit(Some(encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+
+        let slice = readback.slice(..);
+        if pollster::block_on(slice.map_async(wgpu::MapMode::Read)).is_err() {
+            return false;
+        }
+
+        let data = slice.get_mapped_range();
+        let updated = bytemuck::cast_slice(&data);
+        if updated.len() != weights.len() {
+            return false;
+        }
+        weights.copy_from_slice(updated);
+        drop(data);
+        readback.unmap();
+        true
+    }
+}
 
 fn is_punct(token: &str) -> bool {
     matches!(token, "." | "," | "!" | "?" | ";" | ":")
@@ -1339,8 +1578,22 @@ impl NudgeBot {
 
     /// LAZY NORMALIZATION: Call this ONCE at the very end, not during training!
     /// This saves millions of calculations for large datasets
-    fn finalize(&mut self) {
+    fn finalize(&mut self, gpu: Option<&GpuBackend>) {
         println!("[◐] Finalizing model and normalizing weights...");
+        self.normalize_transitions(gpu);
+        println!("[✓] Model finalized");
+    }
+
+    fn normalize_transitions(&mut self, gpu: Option<&GpuBackend>) {
+        if let Some(gpu) = gpu {
+            if self.normalize_transitions_gpu(gpu) {
+                return;
+            }
+        }
+        self.normalize_transitions_cpu();
+    }
+
+    fn normalize_transitions_cpu(&mut self) {
         for transitions_list in self.transitions.values_mut() {
             let total: f32 = transitions_list
                 .iter()
@@ -1354,7 +1607,49 @@ impl NudgeBot {
                 }
             }
         }
-        println!("[✓] Model finalized");
+    }
+
+    fn normalize_transitions_gpu(&mut self, gpu: &GpuBackend) -> bool {
+        let mut transitions = std::mem::take(&mut self.transitions);
+        let mut entries: Vec<(String, Vec<(String, TransitionWeight)>)> = transitions.drain().collect();
+        let total_weights: usize = entries.iter().map(|(_, list)| list.len()).sum();
+        if total_weights < GPU_NORMALIZE_MIN_WEIGHTS {
+            self.transitions = entries.into_iter().collect();
+            return false;
+        }
+
+        let mut weights: Vec<f32> = Vec::with_capacity(total_weights);
+        let mut word_index: Vec<u32> = Vec::with_capacity(total_weights);
+        let mut totals: Vec<f32> = Vec::with_capacity(entries.len());
+
+        for (word_idx, (_, list)) in entries.iter().enumerate() {
+            let mut total = 0.0f32;
+            for (_, w) in list.iter() {
+                let value = w.to_f32();
+                total += value;
+                weights.push(value);
+                word_index.push(word_idx as u32);
+            }
+            totals.push(total);
+        }
+
+        if !gpu.normalize_weights(&mut weights, &word_index, &totals) {
+            self.transitions = entries.into_iter().collect();
+            return false;
+        }
+
+        let mut cursor = 0usize;
+        for (_, list) in entries.iter_mut() {
+            for (_, w) in list.iter_mut() {
+                if let Some(value) = weights.get(cursor) {
+                    *w = TransitionWeight::from_f32(*value, self.precision_mode);
+                }
+                cursor += 1;
+            }
+        }
+
+        self.transitions = entries.into_iter().collect();
+        true
     }
 
     /// Scale model contributions (used for --normalize-data)
@@ -1491,20 +1786,8 @@ impl NudgeBot {
     }
 
     /// Renormalize all transitions after merging (called once after parallel merge)
-    fn renormalize(&mut self) {
-        for transitions_list in self.transitions.values_mut() {
-            let total: f32 = transitions_list
-                .iter()
-                .map(|(_, w)| w.to_f32())
-                .sum();
-
-            if total > 0.0 {
-                for (_, w) in transitions_list.iter_mut() {
-                    let normalized = w.to_f32() / total;
-                    *w = TransitionWeight::from_f32(normalized, self.precision_mode);
-                }
-            }
-        }
+    fn renormalize(&mut self, gpu: Option<&GpuBackend>) {
+        self.normalize_transitions(gpu);
     }
 
     /// Apply advanced context nudges with bidirectional awareness
@@ -1945,6 +2228,22 @@ fn parse_pass_arg(args: &[String]) -> Option<String> {
     None
 }
 
+fn parse_gpu_arg(args: &[String]) -> String {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--gpu" {
+            if let Some(value) = args.get(i + 1) {
+                return value.to_ascii_lowercase();
+            }
+        } else if let Some(rest) = arg.strip_prefix("--gpu=") {
+            return rest.to_ascii_lowercase();
+        }
+        i += 1;
+    }
+    "auto".to_string()
+}
+
 fn stream_token(
     token: &str,
     is_first: &mut bool,
@@ -2012,6 +2311,7 @@ fn main() -> Result<()> {
         eprintln!("--normalize-data: equalize per-file influence during training");
         eprintln!("--pass: provide a starting prompt for generation");
         eprintln!("--stream: print tokens as they are generated");
+        eprintln!("--gpu: auto|nvidia|amd|intel|off (GPU normalize when available)");
         std::process::exit(1);
     }
 
@@ -2048,6 +2348,20 @@ fn main() -> Result<()> {
     let stream = args.iter().any(|arg| arg == "--stream");
     let command = &args[1];
     let banned_words = Arc::new(load_nono_words("nono.txt"));
+    let gpu_preference = parse_gpu_arg(&args);
+    let needs_training = matches!(command.as_str(), "train" | "t" | "train-fragment" | "tf" | "merge-fragments" | "mf");
+    let gpu_backend = if needs_training && gpu_preference != "off" && gpu_preference != "cpu" {
+        GpuBackend::init(&gpu_preference)
+    } else {
+        None
+    };
+    if needs_training {
+        if gpu_backend.is_some() {
+            println!("[◐] GPU normalize enabled: {}", gpu_preference);
+        } else if gpu_preference != "off" && gpu_preference != "cpu" {
+            println!("[◐] GPU not available - using CPU");
+        }
+    }
 
     match command.as_str() {
         "train" | "t" => {
@@ -2244,7 +2558,7 @@ fn main() -> Result<()> {
 
             // FINALIZE: Lazy normalization happens ONCE at the very end
             println!("[◐] All threads complete - finalizing model...");
-            final_bot.finalize();
+            final_bot.finalize(gpu_backend.as_ref());
 
             final_bot.save(model_path)?;
             println!("[✓] Parallel training complete!");
@@ -2356,7 +2670,7 @@ fn main() -> Result<()> {
             }
 
             // FINALIZE before saving
-            bot.finalize();
+            bot.finalize(gpu_backend.as_ref());
 
             // Save as .fragment file in fragments/ directory
             fs::create_dir_all("fragments")?;
@@ -2405,7 +2719,7 @@ fn main() -> Result<()> {
 
             // FINALIZE after merging all fragments
             println!("[◐] Finalizing merged model...");
-            merged.finalize();
+            merged.finalize(gpu_backend.as_ref());
 
             merged.save(model_path)?;
             println!("[✓] Merged {} fragments into {}", fragments.len(), model_path);
