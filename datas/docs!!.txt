@@ -30,11 +30,6 @@ long-standing opponents of tort reform, such as President Barack Obama,
 express support for these reforms.3 In only two decades, 36 states have
 adopted apology laws and there is currently a strong push to expand apology
 1 Hillary Rodham Clinton & Barack Obama, Making Patient Safety the
-Centerpiece, 354 N. ENG. J. MED. 2205, 2205 (2006).
-2 See infra section I.B.
-3 See infra section I.C.
-Electronic copy available at: https://ssrn.com/abstract=2835482
-8-Sep-16] Arbel & Kaplan - Draft 3
 law reform to the federal level and other area of law.4
 This Article argues and demonstrates that despite appearances,
 apology laws are de-facto tort reform. Looking beyond the virtuous
@@ -142,12 +137,6 @@ Impact of Apology Laws on Medical Malpractice, 43 J. RISK UNCERTAIN. 141 (2011)
 for insignificant cases, suggesting a potential increase in payouts for those cases). See also
 Benjamin J. McMichael et al., Sorry is Never Enough: The Effect of State Apology Laws on
 Medical Malpractice Liability Risk, manuscript (2016)
-https://www.owen.vanderbilt.edu/faculty-and-research/upload/Apology-Paper-032516.pdf
-($65,000).
-11 See e.g., Erin O’hara O'Connor, Organizational Apologies: BP as a Case Study,
-64 VAND. L. REV. 1957, 1977-1979 (2011) (discussing the role and effect of corporate
-apologies).
-Electronic copy available at: https://ssrn.com/abstract=2835482
 6 Draft, [8-Sep-16
 I. STRANGE BEDFELLOWS: OF ETHICISTS AND TORT REFORMERS
 In recent decades, legal scholars from distinct disciplines-----ethicists,
@@ -313,7 +302,6 @@ Taking Legal Action, 343 LANCET 1609, 1612 (1994) (finding that 37% of responden
 that they would not have sued had there been a full explanation and an apology and 14%
 indicated that they would not have sued had there been an admission of negligence); Amy
 B. Witman et al., How Do Patients Want Physicians to Handle Mistakes? A Survey of
-Electronic copy available at: https://ssrn.com/abstract=2835482
 10 Draft, [8-Sep-16
 experimental studies, Robbennolt found that apologies increase victims’
 belief that they would win their lawsuits, but, paradoxically, that they had
@@ -397,8 +385,6 @@ apologies in order to use them as a basis for a lawsuit, see O'Hara & Yarn, supr
 For a critique stating that apologies are helpful even when they do not admit blame, see
 Helmreich, supra note 22, at 609.
 39 On strategic apologies, see Ebert, supra note 20, at 364 (“a wrongdoer might
-Electronic copy available at: https://ssrn.com/abstract=2835482
-12 Draft, [8-Sep-16
 apologies would lead victims to accept settlements that do not compensate
 them fully.40 Despite these challenges, the movement itself is still going
 strong, seemingly in the belief that none of these challenges is
@@ -439,7 +425,6 @@ legal entitlement --an entitlement that the apology itself makes concrete?”); 
 Teninbaum, How Medical Apology Programs Harm Patients, 15 CHAPMAN L. REV. 307, 309
 (2011) ("modern apology programs appear to cool their marks out as a means of preventing
 them from speaking to a lawyer and becoming educated about their legal rights.")
-Electronic copy available at: https://ssrn.com/abstract=2835482
 8-Sep-16] Arbel & Kaplan - Draft 13
 ‘‘defensive medicine’’, i.e., prescribing tests and procedures for the sole
 purpose of reducing liability risk.41 Both the costs of liability and those of
@@ -771,15 +756,13 @@ A. A Theory of Apologies
 The two primary goals of tort law are compensation of victims and
 will help.”)
 82 See S.1784: National MEDiC Act, 109th Congress, 2005-2006
-https://www.govtrack.us/congress/bills/109/s1784; Runnels, supra note 4, at 156 (discussing
+Runnels, supra note 4, at 156 (discussing
 the bill), Clinton & Obama, supra note 1, at 2206 (discussing the bill).
 83 See Benjamin Ho & Elaine Liu, Does Sorry Work? The Impact of Apology Laws
 on Medical Malpractice, 43 J. RISK UNCERTAIN. 141, 144 note 5 (2011) (noting that
 regression analysis shows that “political composition in the State Senate and State House has
 no significant explanatory power on the passage of apology laws.” They also find that
-apology laws are not correlated with other tort reforms.).
-Electronic copy available at: https://ssrn.com/abstract=2835482
-8-Sep-16] Arbel & Kaplan - Draft 21
+apology laws are not correlated with other tort reforms.). Arbel & Kaplan - Draft 21
 deterrence of wrongdoers; an important secondary goal is the reduction of
 litigation costs.84
 Controlling the costs of disputes, and litigation in particular, has
@@ -819,9 +802,7 @@ product liability)
 87 For example, Deborah L. Levi is a practicing mediator; Jennifer K. Robbennolt
 is an expert on dispute resolution; and Robyn Carroll is an expert on dispute resolution and
 mediation.
-Electronic copy available at: https://ssrn.com/abstract=2835482
-22 Draft, [8-Sep-16
-being equal-----much lesser incentive to avoid the activity or to invest in
+being equal uch lesser incentive to avoid the activity or to invest in
 precautions. This does not mean that the injurer will not care at all or that
 the effect of apologies is necessarily negative, but it does imply that injurers
 will have less incentive to take care than they would otherwise.88
